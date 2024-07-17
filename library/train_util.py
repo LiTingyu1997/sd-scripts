@@ -4501,17 +4501,16 @@ def pool_workaround(
 
     return pooled_output
 
-
+from mindspore import ops, Tensor
 def get_hidden_states_sdxl(
     max_token_length: int,
-    input_ids1: torch.Tensor,
-    input_ids2: torch.Tensor,
+    input_ids1: Tensor,
+    input_ids2: Tensor,
     tokenizer1: CLIPTokenizer,
     tokenizer2: CLIPTokenizer,
     text_encoder1: CLIPTextModel,
     text_encoder2: CLIPTextModelWithProjection,
     weight_dtype: Optional[str] = None,
-    accelerator: Optional[Accelerator] = None,
 ):
     # input_ids: b,n,77 -> b*n, 77
     b_size = input_ids1.size()[0]
@@ -4527,7 +4526,7 @@ def get_hidden_states_sdxl(
     hidden_states2 = enc_out["hidden_states"][-2]  # penuultimate layer
 
     # pool2 = enc_out["text_embeds"]
-    unwrapped_text_encoder2 = text_encoder2 if accelerator is None else accelerator.unwrap_model(text_encoder2)
+    unwrapped_text_encoder2 = text_encoder2 #if accelerator is None else accelerator.unwrap_model(text_encoder2)
     pool2 = pool_workaround(unwrapped_text_encoder2, enc_out["last_hidden_state"], input_ids2, tokenizer2.eos_token_id)
 
     # b*n, 77, 768 or 1280 -> b, n*77, 768 or 1280
@@ -4542,7 +4541,7 @@ def get_hidden_states_sdxl(
         for i in range(1, max_token_length, tokenizer1.model_max_length):
             states_list.append(hidden_states1[:, i : i + tokenizer1.model_max_length - 2])  # <BOS> の後から <EOS> の前まで
         states_list.append(hidden_states1[:, -1].unsqueeze(1))  # <EOS>
-        hidden_states1 = torch.cat(states_list, dim=1)
+        hidden_states1 = ops.cat(states_list, axis=1)
 
         # v2: <BOS>...<EOS> <PAD> ... の三連を <BOS>...<EOS> <PAD> ... へ戻す　正直この実装でいいのかわからん
         states_list = [hidden_states2[:, 0].unsqueeze(1)]  # <BOS>
@@ -4556,7 +4555,7 @@ def get_hidden_states_sdxl(
             #             chunk[j, 0] = chunk[j, 1]  # 次の <PAD> の値をコピーする
             states_list.append(chunk)  # <BOS> の後から <EOS> の前まで
         states_list.append(hidden_states2[:, -1].unsqueeze(1))  # <EOS> か <PAD> のどちらか
-        hidden_states2 = torch.cat(states_list, dim=1)
+        hidden_states2 = ops.cat(states_list, axis=1)
 
         # pool はnの最初のものを使う
         pool2 = pool2[::n_size]
