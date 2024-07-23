@@ -4,6 +4,9 @@ import os
 from typing import Optional
 
 import torch
+import mindspore as ms
+import mindone
+
 from library.device_utils import init_ipex, clean_memory_on_device
 init_ipex()
 
@@ -25,36 +28,36 @@ TOKENIZER2_PATH = "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k"
 
 def load_target_model(args, accelerator, model_version: str, weight_dtype):
     model_dtype = match_mixed_precision(args, weight_dtype)  # prepare fp16/bf16
-    for pi in range(accelerator.state.num_processes):
-        if pi == accelerator.state.local_process_index:
-            logger.info(f"loading model for process {accelerator.state.local_process_index}/{accelerator.state.num_processes}")
+    # for pi in range(accelerator.state.num_processes):
+    #     if pi == accelerator.state.local_process_index:
+    logger.info(f"loading model for process {accelerator.state.local_process_index}/{accelerator.state.num_processes}")
 
-            (
-                load_stable_diffusion_format,
-                text_encoder1,
-                text_encoder2,
-                vae,
-                unet,
-                logit_scale,
-                ckpt_info,
-            ) = _load_target_model(
-                args.pretrained_model_name_or_path,
-                args.vae,
-                model_version,
-                weight_dtype,
-                accelerator.device if args.lowram else "cpu",
-                model_dtype,
-            )
+    (
+        load_stable_diffusion_format,
+        text_encoder1,
+        text_encoder2,
+        vae,
+        unet,
+        logit_scale,
+        ckpt_info,
+    ) = _load_target_model(
+        args.pretrained_model_name_or_path,
+        args.vae,
+        model_version,
+        weight_dtype,
+        accelerator.device if args.lowram else "cpu",
+        model_dtype,
+    )
 
-            # work on low-ram device
-            if args.lowram:
-                text_encoder1.to(accelerator.device)
-                text_encoder2.to(accelerator.device)
-                unet.to(accelerator.device)
-                vae.to(accelerator.device)
+        #     # work on low-ram device
+        #     if args.lowram:
+        #         text_encoder1.to(accelerator.device)
+        #         text_encoder2.to(accelerator.device)
+        #         unet.to(accelerator.device)
+        #         vae.to(accelerator.device)
 
-            clean_memory_on_device(accelerator.device)
-        accelerator.wait_for_everyone()
+        #     clean_memory_on_device(accelerator.device)
+        # accelerator.wait_for_everyone()
 
     return load_stable_diffusion_format, text_encoder1, text_encoder2, vae, unet, logit_scale, ckpt_info
 
@@ -78,7 +81,7 @@ def _load_target_model(
         ) = sdxl_model_util.load_models_from_sdxl_checkpoint(model_version, name_or_path, device, model_dtype)
     else:
         # Diffusers model is loaded to CPU
-        from diffusers import StableDiffusionXLPipeline
+        from mindone.diffusers import StableDiffusionXLPipeline
 
         variant = "fp16" if weight_dtype == torch.float16 else None
         logger.info(f"load Diffusers pretrained models: {name_or_path}, variant={variant}")
@@ -103,10 +106,10 @@ def _load_target_model(
         text_encoder2 = pipe.text_encoder_2
 
         # convert to fp32 for cache text_encoders outputs
-        if text_encoder1.dtype != torch.float32:
-            text_encoder1 = text_encoder1.to(dtype=torch.float32)
-        if text_encoder2.dtype != torch.float32:
-            text_encoder2 = text_encoder2.to(dtype=torch.float32)
+        if text_encoder1.dtype != ms.float32:
+            text_encoder1 = text_encoder1.to(dtype=ms.float32)
+        if text_encoder2.dtype != ms.float32:
+            text_encoder2 = text_encoder2.to(dtype=ms.float32)
 
         vae = pipe.vae
         unet = pipe.unet
@@ -116,7 +119,7 @@ def _load_target_model(
         state_dict = sdxl_model_util.convert_diffusers_unet_state_dict_to_sdxl(unet.state_dict())
         with init_empty_weights():
             unet = sdxl_original_unet.SdxlUNet2DConditionModel()  # overwrite unet
-        sdxl_model_util._load_state_dict_on_device(unet, state_dict, device=device, dtype=model_dtype)
+        #sdxl_model_util._load_state_dict_on_device(unet, state_dict, device=device, dtype=model_dtype)
         logger.info("U-Net converted to original U-Net")
 
         logit_scale = None
@@ -164,12 +167,12 @@ def load_tokenizers(args: argparse.Namespace):
 def match_mixed_precision(args, weight_dtype):
     if args.full_fp16:
         assert (
-            weight_dtype == torch.float16
+            weight_dtype == ms.float16
         ), "full_fp16 requires mixed precision='fp16' / full_fp16を使う場合はmixed_precision='fp16'を指定してください。"
         return weight_dtype
     elif args.full_bf16:
         assert (
-            weight_dtype == torch.bfloat16
+            weight_dtype == ms.bfloat16
         ), "full_bf16 requires mixed precision='bf16' / full_bf16を使う場合はmixed_precision='bf16'を指定してください。"
         return weight_dtype
     else:
@@ -186,7 +189,7 @@ def timestep_embedding(timesteps, dim, max_period=10000):
     :return: an [N x dim] Tensor of positional embeddings.
     """
     half = dim // 2
-    freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(
+    freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=ms.float32) / half).to(
         device=timesteps.device
     )
     args = timesteps[:, None].float() * freqs[None]

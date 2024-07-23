@@ -25,10 +25,8 @@
 import math
 from types import SimpleNamespace
 from typing import Any, Optional
-import torch
-import torch.utils.checkpoint
-from torch import nn
-from torch.nn import functional as F
+import mindspore as ms
+from mindspore import nn, ops, Tensor
 from einops import rearrange
 from .utils import setup_logging
 
@@ -49,8 +47,6 @@ USE_REENTRANT = True
 # region memory efficient attention
 
 # FlashAttentionを使うCrossAttention
-# based on https://github.com/lucidrains/memory-efficient-attention-pytorch/blob/main/memory_efficient_attention_pytorch/flash_attention.py
-# LICENSE MIT https://github.com/lucidrains/memory-efficient-attention-pytorch/blob/main/LICENSE
 
 # constants
 
@@ -72,171 +68,167 @@ def default(val, d):
 # https://arxiv.org/abs/2205.14135
 
 
-class FlashAttentionFunction(torch.autograd.Function):
-    @staticmethod
-    @torch.no_grad()
-    def forward(ctx, q, k, v, mask, causal, q_bucket_size, k_bucket_size):
-        """Algorithm 2 in the paper"""
+# class FlashAttentionFunction(torch.autograd.Function):
+#     @staticmethod
+#     @torch.no_grad()
+#     def construct(ctx, q, k, v, mask, causal, q_bucket_size, k_bucket_size):
+#         """Algorithm 2 in the paper"""
 
-        device = q.device
-        dtype = q.dtype
-        max_neg_value = -torch.finfo(q.dtype).max
-        qk_len_diff = max(k.shape[-2] - q.shape[-2], 0)
+#         device = q.device
+#         dtype = q.dtype
+#         max_neg_value = -torch.finfo(q.dtype).max
+#         qk_len_diff = max(k.shape[-2] - q.shape[-2], 0)
 
-        o = torch.zeros_like(q)
-        all_row_sums = torch.zeros((*q.shape[:-1], 1), dtype=dtype, device=device)
-        all_row_maxes = torch.full((*q.shape[:-1], 1), max_neg_value, dtype=dtype, device=device)
+#         o = torch.zeros_like(q)
+#         all_row_sums = torch.zeros((*q.shape[:-1], 1), dtype=dtype, device=device)
+#         all_row_maxes = torch.full((*q.shape[:-1], 1), max_neg_value, dtype=dtype, device=device)
 
-        scale = q.shape[-1] ** -0.5
+#         scale = q.shape[-1] ** -0.5
 
-        if not exists(mask):
-            mask = (None,) * math.ceil(q.shape[-2] / q_bucket_size)
-        else:
-            mask = rearrange(mask, "b n -> b 1 1 n")
-            mask = mask.split(q_bucket_size, dim=-1)
+#         if not exists(mask):
+#             mask = (None,) * math.ceil(q.shape[-2] / q_bucket_size)
+#         else:
+#             mask = rearrange(mask, "b n -> b 1 1 n")
+#             mask = mask.split(q_bucket_size, dim=-1)
 
-        row_splits = zip(
-            q.split(q_bucket_size, dim=-2),
-            o.split(q_bucket_size, dim=-2),
-            mask,
-            all_row_sums.split(q_bucket_size, dim=-2),
-            all_row_maxes.split(q_bucket_size, dim=-2),
-        )
+#         row_splits = zip(
+#             q.split(q_bucket_size, dim=-2),
+#             o.split(q_bucket_size, dim=-2),
+#             mask,
+#             all_row_sums.split(q_bucket_size, dim=-2),
+#             all_row_maxes.split(q_bucket_size, dim=-2),
+#         )
 
-        for ind, (qc, oc, row_mask, row_sums, row_maxes) in enumerate(row_splits):
-            q_start_index = ind * q_bucket_size - qk_len_diff
+#         for ind, (qc, oc, row_mask, row_sums, row_maxes) in enumerate(row_splits):
+#             q_start_index = ind * q_bucket_size - qk_len_diff
 
-            col_splits = zip(
-                k.split(k_bucket_size, dim=-2),
-                v.split(k_bucket_size, dim=-2),
-            )
+#             col_splits = zip(
+#                 k.split(k_bucket_size, dim=-2),
+#                 v.split(k_bucket_size, dim=-2),
+#             )
 
-            for k_ind, (kc, vc) in enumerate(col_splits):
-                k_start_index = k_ind * k_bucket_size
+#             for k_ind, (kc, vc) in enumerate(col_splits):
+#                 k_start_index = k_ind * k_bucket_size
 
-                attn_weights = torch.einsum("... i d, ... j d -> ... i j", qc, kc) * scale
+#                 attn_weights = torch.einsum("... i d, ... j d -> ... i j", qc, kc) * scale
 
-                if exists(row_mask):
-                    attn_weights.masked_fill_(~row_mask, max_neg_value)
+#                 if exists(row_mask):
+#                     attn_weights.masked_fill_(~row_mask, max_neg_value)
 
-                if causal and q_start_index < (k_start_index + k_bucket_size - 1):
-                    causal_mask = torch.ones((qc.shape[-2], kc.shape[-2]), dtype=torch.bool, device=device).triu(
-                        q_start_index - k_start_index + 1
-                    )
-                    attn_weights.masked_fill_(causal_mask, max_neg_value)
+#                 if causal and q_start_index < (k_start_index + k_bucket_size - 1):
+#                     causal_mask = torch.ones((qc.shape[-2], kc.shape[-2]), dtype=torch.bool, device=device).triu(
+#                         q_start_index - k_start_index + 1
+#                     )
+#                     attn_weights.masked_fill_(causal_mask, max_neg_value)
 
-                block_row_maxes = attn_weights.amax(dim=-1, keepdims=True)
-                attn_weights -= block_row_maxes
-                exp_weights = torch.exp(attn_weights)
+#                 block_row_maxes = attn_weights.amax(dim=-1, keepdims=True)
+#                 attn_weights -= block_row_maxes
+#                 exp_weights = torch.exp(attn_weights)
 
-                if exists(row_mask):
-                    exp_weights.masked_fill_(~row_mask, 0.0)
+#                 if exists(row_mask):
+#                     exp_weights.masked_fill_(~row_mask, 0.0)
 
-                block_row_sums = exp_weights.sum(dim=-1, keepdims=True).clamp(min=EPSILON)
+#                 block_row_sums = exp_weights.sum(dim=-1, keepdims=True).clamp(min=EPSILON)
 
-                new_row_maxes = torch.maximum(block_row_maxes, row_maxes)
+#                 new_row_maxes = torch.maximum(block_row_maxes, row_maxes)
 
-                exp_values = torch.einsum("... i j, ... j d -> ... i d", exp_weights, vc)
+#                 exp_values = torch.einsum("... i j, ... j d -> ... i d", exp_weights, vc)
 
-                exp_row_max_diff = torch.exp(row_maxes - new_row_maxes)
-                exp_block_row_max_diff = torch.exp(block_row_maxes - new_row_maxes)
+#                 exp_row_max_diff = torch.exp(row_maxes - new_row_maxes)
+#                 exp_block_row_max_diff = torch.exp(block_row_maxes - new_row_maxes)
 
-                new_row_sums = exp_row_max_diff * row_sums + exp_block_row_max_diff * block_row_sums
+#                 new_row_sums = exp_row_max_diff * row_sums + exp_block_row_max_diff * block_row_sums
 
-                oc.mul_((row_sums / new_row_sums) * exp_row_max_diff).add_((exp_block_row_max_diff / new_row_sums) * exp_values)
+#                 oc.mul_((row_sums / new_row_sums) * exp_row_max_diff).add_((exp_block_row_max_diff / new_row_sums) * exp_values)
 
-                row_maxes.copy_(new_row_maxes)
-                row_sums.copy_(new_row_sums)
+#                 row_maxes.copy_(new_row_maxes)
+#                 row_sums.copy_(new_row_sums)
 
-        ctx.args = (causal, scale, mask, q_bucket_size, k_bucket_size)
-        ctx.save_for_backward(q, k, v, o, all_row_sums, all_row_maxes)
+#         ctx.args = (causal, scale, mask, q_bucket_size, k_bucket_size)
+#         ctx.save_for_backward(q, k, v, o, all_row_sums, all_row_maxes)
 
-        return o
+#         return o
 
-    @staticmethod
-    @torch.no_grad()
-    def backward(ctx, do):
-        """Algorithm 4 in the paper"""
+#     @staticmethod
+#     @torch.no_grad()
+#     def backward(ctx, do):
+#         """Algorithm 4 in the paper"""
 
-        causal, scale, mask, q_bucket_size, k_bucket_size = ctx.args
-        q, k, v, o, l, m = ctx.saved_tensors
+#         causal, scale, mask, q_bucket_size, k_bucket_size = ctx.args
+#         q, k, v, o, l, m = ctx.saved_tensors
 
-        device = q.device
+#         device = q.device
 
-        max_neg_value = -torch.finfo(q.dtype).max
-        qk_len_diff = max(k.shape[-2] - q.shape[-2], 0)
+#         max_neg_value = -torch.finfo(q.dtype).max
+#         qk_len_diff = max(k.shape[-2] - q.shape[-2], 0)
 
-        dq = torch.zeros_like(q)
-        dk = torch.zeros_like(k)
-        dv = torch.zeros_like(v)
+#         dq = torch.zeros_like(q)
+#         dk = torch.zeros_like(k)
+#         dv = torch.zeros_like(v)
 
-        row_splits = zip(
-            q.split(q_bucket_size, dim=-2),
-            o.split(q_bucket_size, dim=-2),
-            do.split(q_bucket_size, dim=-2),
-            mask,
-            l.split(q_bucket_size, dim=-2),
-            m.split(q_bucket_size, dim=-2),
-            dq.split(q_bucket_size, dim=-2),
-        )
+#         row_splits = zip(
+#             q.split(q_bucket_size, dim=-2),
+#             o.split(q_bucket_size, dim=-2),
+#             do.split(q_bucket_size, dim=-2),
+#             mask,
+#             l.split(q_bucket_size, dim=-2),
+#             m.split(q_bucket_size, dim=-2),
+#             dq.split(q_bucket_size, dim=-2),
+#         )
 
-        for ind, (qc, oc, doc, row_mask, lc, mc, dqc) in enumerate(row_splits):
-            q_start_index = ind * q_bucket_size - qk_len_diff
+#         for ind, (qc, oc, doc, row_mask, lc, mc, dqc) in enumerate(row_splits):
+#             q_start_index = ind * q_bucket_size - qk_len_diff
 
-            col_splits = zip(
-                k.split(k_bucket_size, dim=-2),
-                v.split(k_bucket_size, dim=-2),
-                dk.split(k_bucket_size, dim=-2),
-                dv.split(k_bucket_size, dim=-2),
-            )
+#             col_splits = zip(
+#                 k.split(k_bucket_size, dim=-2),
+#                 v.split(k_bucket_size, dim=-2),
+#                 dk.split(k_bucket_size, dim=-2),
+#                 dv.split(k_bucket_size, dim=-2),
+#             )
 
-            for k_ind, (kc, vc, dkc, dvc) in enumerate(col_splits):
-                k_start_index = k_ind * k_bucket_size
+#             for k_ind, (kc, vc, dkc, dvc) in enumerate(col_splits):
+#                 k_start_index = k_ind * k_bucket_size
 
-                attn_weights = torch.einsum("... i d, ... j d -> ... i j", qc, kc) * scale
+#                 attn_weights = torch.einsum("... i d, ... j d -> ... i j", qc, kc) * scale
 
-                if causal and q_start_index < (k_start_index + k_bucket_size - 1):
-                    causal_mask = torch.ones((qc.shape[-2], kc.shape[-2]), dtype=torch.bool, device=device).triu(
-                        q_start_index - k_start_index + 1
-                    )
-                    attn_weights.masked_fill_(causal_mask, max_neg_value)
+#                 if causal and q_start_index < (k_start_index + k_bucket_size - 1):
+#                     causal_mask = torch.ones((qc.shape[-2], kc.shape[-2]), dtype=torch.bool, device=device).triu(
+#                         q_start_index - k_start_index + 1
+#                     )
+#                     attn_weights.masked_fill_(causal_mask, max_neg_value)
 
-                exp_attn_weights = torch.exp(attn_weights - mc)
+#                 exp_attn_weights = torch.exp(attn_weights - mc)
 
-                if exists(row_mask):
-                    exp_attn_weights.masked_fill_(~row_mask, 0.0)
+#                 if exists(row_mask):
+#                     exp_attn_weights.masked_fill_(~row_mask, 0.0)
 
-                p = exp_attn_weights / lc
+#                 p = exp_attn_weights / lc
 
-                dv_chunk = torch.einsum("... i j, ... i d -> ... j d", p, doc)
-                dp = torch.einsum("... i d, ... j d -> ... i j", doc, vc)
+#                 dv_chunk = torch.einsum("... i j, ... i d -> ... j d", p, doc)
+#                 dp = torch.einsum("... i d, ... j d -> ... i j", doc, vc)
 
-                D = (doc * oc).sum(dim=-1, keepdims=True)
-                ds = p * scale * (dp - D)
+#                 D = (doc * oc).sum(dim=-1, keepdims=True)
+#                 ds = p * scale * (dp - D)
 
-                dq_chunk = torch.einsum("... i j, ... j d -> ... i d", ds, kc)
-                dk_chunk = torch.einsum("... i j, ... i d -> ... j d", ds, qc)
+#                 dq_chunk = torch.einsum("... i j, ... j d -> ... i d", ds, kc)
+#                 dk_chunk = torch.einsum("... i j, ... i d -> ... j d", ds, qc)
 
-                dqc.add_(dq_chunk)
-                dkc.add_(dk_chunk)
-                dvc.add_(dv_chunk)
+#                 dqc.add_(dq_chunk)
+#                 dkc.add_(dk_chunk)
+#                 dvc.add_(dv_chunk)
 
-        return dq, dk, dv, None, None, None, None
-
-
-# endregion
+#         return dq, dk, dv, None, None, None, None
 
 
-def get_parameter_dtype(parameter: torch.nn.Module):
+# # endregion
+
+
+def get_parameter_dtype(parameter: nn.Cell):
     return next(parameter.parameters()).dtype
 
 
-def get_parameter_device(parameter: torch.nn.Module):
-    return next(parameter.parameters()).device
-
-
 def get_timestep_embedding(
-    timesteps: torch.Tensor,
+    timesteps: Tensor,
     embedding_dim: int,
     downscale_freq_shift: float = 1,
     scale: float = 1,
@@ -253,49 +245,49 @@ def get_timestep_embedding(
     assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
 
     half_dim = embedding_dim // 2
-    exponent = -math.log(max_period) * torch.arange(start=0, end=half_dim, dtype=torch.float32, device=timesteps.device)
+    exponent = -math.log(max_period) * ops.arange(start=0, end=half_dim, dtype=ms.float32)
     exponent = exponent / (half_dim - downscale_freq_shift)
 
-    emb = torch.exp(exponent)
+    emb = ops.exp(exponent)
     emb = timesteps[:, None].float() * emb[None, :]
 
     # scale embeddings
     emb = scale * emb
 
     # concat sine and cosine embeddings: flipped from Diffusers original ver because always flip_sin_to_cos=True
-    emb = torch.cat([torch.cos(emb), torch.sin(emb)], dim=-1)
+    emb = ops.cat([ops.cos(emb), ops.sin(emb)], axis=-1)
 
     # zero pad
     if embedding_dim % 2 == 1:
-        emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
+        emb = ops.pad(emb, (0, 1, 0, 0))
     return emb
 
 
 # Deep Shrink: We do not common this function, because minimize dependencies.
 def resize_like(x, target, mode="bicubic", align_corners=False):
     org_dtype = x.dtype
-    if org_dtype == torch.bfloat16:
-        x = x.to(torch.float32)
+    if org_dtype == ms.bfloat16:
+        x = x.to(ms.float32)
 
     if x.shape[-2:] != target.shape[-2:]:
         if mode == "nearest":
-            x = F.interpolate(x, size=target.shape[-2:], mode=mode)
+            x = ops.interpolate(x, size=target.shape[-2:], mode=mode)
         else:
-            x = F.interpolate(x, size=target.shape[-2:], mode=mode, align_corners=align_corners)
+            x = ops.interpolate(x, size=target.shape[-2:], mode=mode, align_corners=align_corners)
 
-    if org_dtype == torch.bfloat16:
+    if org_dtype == ms.bfloat16:
         x = x.to(org_dtype)
     return x
 
 
 class GroupNorm32(nn.GroupNorm):
-    def forward(self, x):
-        if self.weight.dtype != torch.float32:
-            return super().forward(x)
-        return super().forward(x.float()).type(x.dtype)
+    def construct(self, x):
+        if self.weight.dtype != ms.float32:
+            return super().construct(x)
+        return super().construct(x.float()).type(x.dtype)
 
 
-class ResnetBlock2D(nn.Module):
+class ResnetBlock2D(nn.Cell):
     def __init__(
         self,
         in_channels,
@@ -305,15 +297,15 @@ class ResnetBlock2D(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
 
-        self.in_layers = nn.Sequential(
+        self.in_layers = nn.SequentialCell(
             GroupNorm32(32, in_channels),
             nn.SiLU(),
             nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1),
         )
 
-        self.emb_layers = nn.Sequential(nn.SiLU(), nn.Linear(TIME_EMBED_DIM, out_channels))
+        self.emb_layers = nn.SequentialCell(nn.SiLU(), nn.Dense(TIME_EMBED_DIM, out_channels))
 
-        self.out_layers = nn.Sequential(
+        self.out_layers = nn.SequentialCell(
             GroupNorm32(32, out_channels),
             nn.SiLU(),
             nn.Identity(),  # to make state_dict compatible with original model
@@ -327,32 +319,41 @@ class ResnetBlock2D(nn.Module):
 
         self.gradient_checkpointing = False
 
-    def forward_body(self, x, emb):
+    def construct_body(self, x, emb):
         h = self.in_layers(x)
         emb_out = self.emb_layers(emb).type(h.dtype)
         h = h + emb_out[:, :, None, None]
         h = self.out_layers(h)
         x = self.skip_connection(x)
         return x + h
+    
+    @property
+    def gradient_checkpointing(self):
+        return self._gradient_checkpointing
 
-    def forward(self, x, emb):
-        if self.training and self.gradient_checkpointing:
-            # logger.info("ResnetBlock2D: gradient_checkpointing")
+    @gradient_checkpointing.setter
+    def gradient_checkpointing(self, value):
+        self._gradient_checkpointing = value
+        self.construct_body._recompute(value)
 
-            def create_custom_forward(func):
-                def custom_forward(*inputs):
-                    return func(*inputs)
+    def construct(self, x, emb):
+        # if self.training and self.gradient_checkpointing:
+        #     # logger.info("ResnetBlock2D: gradient_checkpointing")
 
-                return custom_forward
+        #     def create_custom_forward(func):
+        #         def custom_forward(*inputs):
+        #             return func(*inputs)
 
-            x = torch.utils.checkpoint.checkpoint(create_custom_forward(self.forward_body), x, emb, use_reentrant=USE_REENTRANT)
-        else:
-            x = self.forward_body(x, emb)
+        #         return custom_forward
+
+        #     x = torch.utils.checkpoint.checkpoint(create_custom_forward(self.forward_body), x, emb, use_reentrant=USE_REENTRANT)
+        # else:
+        x = self.construct_body(x, emb)
 
         return x
 
 
-class Downsample2D(nn.Module):
+class Downsample2D(nn.Cell):
     def __init__(self, channels, out_channels):
         super().__init__()
 
@@ -363,32 +364,41 @@ class Downsample2D(nn.Module):
 
         self.gradient_checkpointing = False
 
-    def forward_body(self, hidden_states):
+    def construct_body(self, hidden_states):
         assert hidden_states.shape[1] == self.channels
         hidden_states = self.op(hidden_states)
 
         return hidden_states
+    
+    @property
+    def gradient_checkpointing(self):
+        return self._gradient_checkpointing
 
-    def forward(self, hidden_states):
-        if self.training and self.gradient_checkpointing:
-            # logger.info("Downsample2D: gradient_checkpointing")
+    @gradient_checkpointing.setter
+    def gradient_checkpointing(self, value):
+        self._gradient_checkpointing = value
+        self.construct_body._recompute(value)
 
-            def create_custom_forward(func):
-                def custom_forward(*inputs):
-                    return func(*inputs)
+    def construct(self, hidden_states):
+        # if self.training and self.gradient_checkpointing:
+        #     # logger.info("Downsample2D: gradient_checkpointing")
 
-                return custom_forward
+        #     def create_custom_forward(func):
+        #         def custom_forward(*inputs):
+        #             return func(*inputs)
 
-            hidden_states = torch.utils.checkpoint.checkpoint(
-                create_custom_forward(self.forward_body), hidden_states, use_reentrant=USE_REENTRANT
-            )
-        else:
-            hidden_states = self.forward_body(hidden_states)
+        #         return custom_forward
+
+        #     hidden_states = torch.utils.checkpoint.checkpoint(
+        #         create_custom_forward(self.forward_body), hidden_states, use_reentrant=USE_REENTRANT
+        #     )
+        # else:
+        hidden_states = self.construct_body(hidden_states)
 
         return hidden_states
 
 
-class CrossAttention(nn.Module):
+class CrossAttention(nn.Cell):
     def __init__(
         self,
         query_dim: int,
@@ -405,12 +415,12 @@ class CrossAttention(nn.Module):
         self.scale = dim_head**-0.5
         self.heads = heads
 
-        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
-        self.to_k = nn.Linear(cross_attention_dim, inner_dim, bias=False)
-        self.to_v = nn.Linear(cross_attention_dim, inner_dim, bias=False)
+        self.to_q = nn.Dense(query_dim, inner_dim, bias=False)
+        self.to_k = nn.Dense(cross_attention_dim, inner_dim, bias=False)
+        self.to_v = nn.Dense(cross_attention_dim, inner_dim, bias=False)
 
-        self.to_out = nn.ModuleList([])
-        self.to_out.append(nn.Linear(inner_dim, query_dim))
+        self.to_out = nn.CellList([])
+        self.to_out.append(nn.Dense(inner_dim, query_dim))
         # no dropout here
 
         self.use_memory_efficient_attention_xformers = False
@@ -438,7 +448,7 @@ class CrossAttention(nn.Module):
         tensor = tensor.permute(0, 2, 1, 3).reshape(batch_size // head_size, seq_len, dim * head_size)
         return tensor
 
-    def forward(self, hidden_states, context=None, mask=None):
+    def construct(self, hidden_states, context=None, mask=None):
         if self.use_memory_efficient_attention_xformers:
             return self.forward_memory_efficient_xformers(hidden_states, context, mask)
         if self.use_memory_efficient_attention_mem_eff:
@@ -467,8 +477,8 @@ class CrossAttention(nn.Module):
             query = query.float()
             key = key.float()
 
-        attention_scores = torch.baddbmm(
-            torch.empty(query.shape[0], query.shape[1], key.shape[1], dtype=query.dtype, device=query.device),
+        attention_scores = ops.baddbmm(
+            ms.numpy.empty(query.shape[0], query.shape[1], key.shape[1], dtype=query.dtype),
             query,
             key.transpose(-1, -2),
             beta=0,
@@ -480,61 +490,61 @@ class CrossAttention(nn.Module):
         attention_probs = attention_probs.to(value.dtype)
 
         # compute attention output
-        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = ops.bmm(attention_probs, value)
 
         # reshape hidden_states
         hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
         return hidden_states
 
     # TODO support Hypernetworks
-    def forward_memory_efficient_xformers(self, x, context=None, mask=None):
-        import xformers.ops
+    # def construct_memory_efficient_xformers(self, x, context=None, mask=None):
+    #     import xformers.ops
 
-        h = self.heads
-        q_in = self.to_q(x)
-        context = context if context is not None else x
-        context = context.to(x.dtype)
-        k_in = self.to_k(context)
-        v_in = self.to_v(context)
+    #     h = self.heads
+    #     q_in = self.to_q(x)
+    #     context = context if context is not None else x
+    #     context = context.to(x.dtype)
+    #     k_in = self.to_k(context)
+    #     v_in = self.to_v(context)
 
-        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b n h d", h=h), (q_in, k_in, v_in))
-        del q_in, k_in, v_in
+    #     q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b n h d", h=h), (q_in, k_in, v_in))
+    #     del q_in, k_in, v_in
 
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
-        out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None)  # 最適なのを選んでくれる
-        del q, k, v
+    #     q = q.contiguous()
+    #     k = k.contiguous()
+    #     v = v.contiguous()
+    #     out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None)  # 最適なのを選んでくれる
+    #     del q, k, v
 
-        out = rearrange(out, "b n h d -> b n (h d)", h=h)
+    #     out = rearrange(out, "b n h d -> b n (h d)", h=h)
 
-        out = self.to_out[0](out)
-        return out
+    #     out = self.to_out[0](out)
+    #     return out
 
-    def forward_memory_efficient_mem_eff(self, x, context=None, mask=None):
-        flash_func = FlashAttentionFunction
+    # def construct_memory_efficient_mem_eff(self, x, context=None, mask=None):
+    #     flash_func = FlashAttentionFunction
 
-        q_bucket_size = 512
-        k_bucket_size = 1024
+    #     q_bucket_size = 512
+    #     k_bucket_size = 1024
 
-        h = self.heads
-        q = self.to_q(x)
-        context = context if context is not None else x
-        context = context.to(x.dtype)
-        k = self.to_k(context)
-        v = self.to_v(context)
-        del context, x
+    #     h = self.heads
+    #     q = self.to_q(x)
+    #     context = context if context is not None else x
+    #     context = context.to(x.dtype)
+    #     k = self.to_k(context)
+    #     v = self.to_v(context)
+    #     del context, x
 
-        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q, k, v))
+    #     q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q, k, v))
 
-        out = flash_func.apply(q, k, v, mask, False, q_bucket_size, k_bucket_size)
+    #     out = flash_func.apply(q, k, v, mask, False, q_bucket_size, k_bucket_size)
 
-        out = rearrange(out, "b h n d -> b n (h d)")
+    #     out = rearrange(out, "b h n d -> b n (h d)")
 
-        out = self.to_out[0](out)
-        return out
+    #     out = self.to_out[0](out)
+    #     return out
 
-    def forward_sdpa(self, x, context=None, mask=None):
+    def construct_sdpa(self, x, context=None, mask=None):
         h = self.heads
         q_in = self.to_q(x)
         context = context if context is not None else x
@@ -554,7 +564,7 @@ class CrossAttention(nn.Module):
 
 
 # feedforward
-class GEGLU(nn.Module):
+class GEGLU(nn.Cell):
     r"""
     A variant of the gated linear unit activation function from https://arxiv.org/abs/2002.05202.
 
@@ -565,20 +575,20 @@ class GEGLU(nn.Module):
 
     def __init__(self, dim_in: int, dim_out: int):
         super().__init__()
-        self.proj = nn.Linear(dim_in, dim_out * 2)
+        self.proj = nn.Dense(dim_in, dim_out * 2)
 
     def gelu(self, gate):
         if gate.device.type != "mps":
             return F.gelu(gate)
         # mps: gelu is not implemented for float16
-        return F.gelu(gate.to(dtype=torch.float32)).to(dtype=gate.dtype)
+        return F.gelu(gate.to(dtype=ms.float32)).to(dtype=gate.dtype)
 
-    def forward(self, hidden_states):
+    def construct(self, hidden_states):
         hidden_states, gate = self.proj(hidden_states).chunk(2, dim=-1)
         return hidden_states * self.gelu(gate)
 
 
-class FeedForward(nn.Module):
+class FeedForward(nn.Cell):
     def __init__(
         self,
         dim: int,
@@ -586,21 +596,21 @@ class FeedForward(nn.Module):
         super().__init__()
         inner_dim = int(dim * 4)  # mult is always 4
 
-        self.net = nn.ModuleList([])
+        self.net = nn.CellList([])
         # project in
         self.net.append(GEGLU(dim, inner_dim))
         # project dropout
         self.net.append(nn.Identity())  # nn.Dropout(0)) # dummy for dropout with 0
         # project out
-        self.net.append(nn.Linear(inner_dim, dim))
+        self.net.append(nn.Dense(inner_dim, dim))
 
-    def forward(self, hidden_states):
+    def construct(self, hidden_states):
         for module in self.net:
             hidden_states = module(hidden_states)
         return hidden_states
 
 
-class BasicTransformerBlock(nn.Module):
+class BasicTransformerBlock(nn.Cell):
     def __init__(
         self, dim: int, num_attention_heads: int, attention_head_dim: int, cross_attention_dim: int, upcast_attention: bool = False
     ):
@@ -641,7 +651,7 @@ class BasicTransformerBlock(nn.Module):
         self.attn1.set_use_sdpa(sdpa)
         self.attn2.set_use_sdpa(sdpa)
 
-    def forward_body(self, hidden_states, context=None, timestep=None):
+    def construct_body(self, hidden_states, context=None, timestep=None):
         # 1. Self-Attention
         norm_hidden_states = self.norm1(hidden_states)
 
@@ -655,27 +665,36 @@ class BasicTransformerBlock(nn.Module):
         hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
 
         return hidden_states
+    
+    @property
+    def gradient_checkpointing(self):
+        return self._gradient_checkpointing
 
-    def forward(self, hidden_states, context=None, timestep=None):
-        if self.training and self.gradient_checkpointing:
-            # logger.info("BasicTransformerBlock: checkpointing")
+    @gradient_checkpointing.setter
+    def gradient_checkpointing(self, value):
+        self._gradient_checkpointing = value
+        self.construct_body._recompute(value)
 
-            def create_custom_forward(func):
-                def custom_forward(*inputs):
-                    return func(*inputs)
+    def construct(self, hidden_states, context=None, timestep=None):
+        # if self.training and self.gradient_checkpointing:
+        #     # logger.info("BasicTransformerBlock: checkpointing")
 
-                return custom_forward
+        #     def create_custom_forward(func):
+        #         def custom_forward(*inputs):
+        #             return func(*inputs)
 
-            output = torch.utils.checkpoint.checkpoint(
-                create_custom_forward(self.forward_body), hidden_states, context, timestep, use_reentrant=USE_REENTRANT
-            )
-        else:
-            output = self.forward_body(hidden_states, context, timestep)
+        #         return custom_forward
+
+        #     output = torch.utils.checkpoint.checkpoint(
+        #         create_custom_forward(self.forward_body), hidden_states, context, timestep, use_reentrant=USE_REENTRANT
+        #     )
+        # else:
+        output = self.construct_body(hidden_states, context, timestep)
 
         return output
 
 
-class Transformer2DModel(nn.Module):
+class Transformer2DModel(nn.Cell):
     def __init__(
         self,
         num_attention_heads: int = 16,
@@ -693,11 +712,11 @@ class Transformer2DModel(nn.Module):
         inner_dim = num_attention_heads * attention_head_dim
         self.use_linear_projection = use_linear_projection
 
-        self.norm = torch.nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+        self.norm = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
         # self.norm = GroupNorm32(32, in_channels, eps=1e-6, affine=True)
 
         if use_linear_projection:
-            self.proj_in = nn.Linear(in_channels, inner_dim)
+            self.proj_in = nn.Dense(in_channels, inner_dim)
         else:
             self.proj_in = nn.Conv2d(in_channels, inner_dim, kernel_size=1, stride=1, padding=0)
 
@@ -713,10 +732,10 @@ class Transformer2DModel(nn.Module):
                 )
             )
 
-        self.transformer_blocks = nn.ModuleList(blocks)
+        self.transformer_blocks = nn.CellList(blocks)
 
         if use_linear_projection:
-            self.proj_out = nn.Linear(in_channels, inner_dim)
+            self.proj_out = nn.Dense(in_channels, inner_dim)
         else:
             self.proj_out = nn.Conv2d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0)
 
@@ -730,7 +749,7 @@ class Transformer2DModel(nn.Module):
         for transformer in self.transformer_blocks:
             transformer.set_use_sdpa(sdpa)
 
-    def forward(self, hidden_states, encoder_hidden_states=None, timestep=None):
+    def construct(self, hidden_states, encoder_hidden_states=None, timestep=None):
         # 1. Input
         batch, _, height, weight = hidden_states.shape
         residual = hidden_states
@@ -762,7 +781,7 @@ class Transformer2DModel(nn.Module):
         return output
 
 
-class Upsample2D(nn.Module):
+class Upsample2D(nn.Cell):
     def __init__(self, channels, out_channels):
         super().__init__()
         self.channels = channels
@@ -771,15 +790,15 @@ class Upsample2D(nn.Module):
 
         self.gradient_checkpointing = False
 
-    def forward_body(self, hidden_states, output_size=None):
+    def construct_body(self, hidden_states, output_size=None):
         assert hidden_states.shape[1] == self.channels
 
         # Cast to float32 to as 'upsample_nearest2d_out_frame' op does not support bfloat16
         # TODO(Suraj): Remove this cast once the issue is fixed in PyTorch
         # https://github.com/pytorch/pytorch/issues/86679
         dtype = hidden_states.dtype
-        if dtype == torch.bfloat16:
-            hidden_states = hidden_states.to(torch.float32)
+        if dtype == ms.bfloat16:
+            hidden_states = hidden_states.to(ms.float32)
 
         # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
         if hidden_states.shape[0] >= 64:
@@ -787,38 +806,47 @@ class Upsample2D(nn.Module):
 
         # if `output_size` is passed we force the interpolation output size and do not make use of `scale_factor=2`
         if output_size is None:
-            hidden_states = F.interpolate(hidden_states, scale_factor=2.0, mode="nearest")
+            hidden_states = ops.interpolate(hidden_states, scale_factor=2.0, mode="nearest")
         else:
-            hidden_states = F.interpolate(hidden_states, size=output_size, mode="nearest")
+            hidden_states = ops.interpolate(hidden_states, size=output_size, mode="nearest")
 
         # If the input is bfloat16, we cast back to bfloat16
-        if dtype == torch.bfloat16:
+        if dtype == ms.bfloat16:
             hidden_states = hidden_states.to(dtype)
 
         hidden_states = self.conv(hidden_states)
 
         return hidden_states
+    
+    @property
+    def gradient_checkpointing(self):
+        return self._gradient_checkpointing
 
-    def forward(self, hidden_states, output_size=None):
-        if self.training and self.gradient_checkpointing:
-            # logger.info("Upsample2D: gradient_checkpointing")
+    @gradient_checkpointing.setter
+    def gradient_checkpointing(self, value):
+        self._gradient_checkpointing = value
+        self.construct_body._recompute(value)
 
-            def create_custom_forward(func):
-                def custom_forward(*inputs):
-                    return func(*inputs)
+    def construct(self, hidden_states, output_size=None):
+        # if self.training and self.gradient_checkpointing:
+        #     # logger.info("Upsample2D: gradient_checkpointing")
 
-                return custom_forward
+        #     def create_custom_forward(func):
+        #         def custom_forward(*inputs):
+        #             return func(*inputs)
 
-            hidden_states = torch.utils.checkpoint.checkpoint(
-                create_custom_forward(self.forward_body), hidden_states, output_size, use_reentrant=USE_REENTRANT
-            )
-        else:
-            hidden_states = self.forward_body(hidden_states, output_size)
+        #         return custom_forward
+
+        #     hidden_states = torch.utils.checkpoint.checkpoint(
+        #         create_custom_forward(self.forward_body), hidden_states, output_size, use_reentrant=USE_REENTRANT
+        #     )
+        # else:
+        hidden_states = self.construct_body(hidden_states, output_size)
 
         return hidden_states
 
 
-class SdxlUNet2DConditionModel(nn.Module):
+class SdxlUNet2DConditionModel(nn.Cell):
     _supports_gradient_checkpointing = True
 
     def __init__(
@@ -837,25 +865,25 @@ class SdxlUNet2DConditionModel(nn.Module):
         # self.sample_size = sample_size
 
         # time embedding
-        self.time_embed = nn.Sequential(
-            nn.Linear(self.model_channels, self.time_embed_dim),
+        self.time_embed = nn.SequentialCell(
+            nn.Dense(self.model_channels, self.time_embed_dim),
             nn.SiLU(),
-            nn.Linear(self.time_embed_dim, self.time_embed_dim),
+            nn.Dense(self.time_embed_dim, self.time_embed_dim),
         )
 
         # label embedding
-        self.label_emb = nn.Sequential(
-            nn.Sequential(
-                nn.Linear(self.adm_in_channels, self.time_embed_dim),
+        self.label_emb = nn.SequentialCell(
+            nn.SequentialCell(
+                nn.Dense(self.adm_in_channels, self.time_embed_dim),
                 nn.SiLU(),
-                nn.Linear(self.time_embed_dim, self.time_embed_dim),
+                nn.Dense(self.time_embed_dim, self.time_embed_dim),
             )
         )
 
         # input
-        self.input_blocks = nn.ModuleList(
+        self.input_blocks = nn.CellList(
             [
-                nn.Sequential(
+                nn.SequentialCell(
                     nn.Conv2d(self.in_channels, self.model_channels, kernel_size=3, padding=(1, 1)),
                 )
             ]
@@ -869,10 +897,10 @@ class SdxlUNet2DConditionModel(nn.Module):
                     out_channels=1 * self.model_channels,
                 ),
             ]
-            self.input_blocks.append(nn.ModuleList(layers))
+            self.input_blocks.append(nn.CellList(layers))
 
         self.input_blocks.append(
-            nn.Sequential(
+            nn.SequentialCell(
                 Downsample2D(
                     channels=1 * self.model_channels,
                     out_channels=1 * self.model_channels,
@@ -896,10 +924,10 @@ class SdxlUNet2DConditionModel(nn.Module):
                     cross_attention_dim=2048,
                 ),
             ]
-            self.input_blocks.append(nn.ModuleList(layers))
+            self.input_blocks.append(nn.CellList(layers))
 
         self.input_blocks.append(
-            nn.Sequential(
+            nn.SequentialCell(
                 Downsample2D(
                     channels=2 * self.model_channels,
                     out_channels=2 * self.model_channels,
@@ -923,10 +951,10 @@ class SdxlUNet2DConditionModel(nn.Module):
                     cross_attention_dim=2048,
                 ),
             ]
-            self.input_blocks.append(nn.ModuleList(layers))
+            self.input_blocks.append(nn.CellList(layers))
 
         # mid
-        self.middle_block = nn.ModuleList(
+        self.middle_block = nn.CellList(
             [
                 ResnetBlock2D(
                     in_channels=4 * self.model_channels,
@@ -948,7 +976,7 @@ class SdxlUNet2DConditionModel(nn.Module):
         )
 
         # output
-        self.output_blocks = nn.ModuleList([])
+        self.output_blocks = nn.CellList([])
 
         # level 2
         for i in range(3):
@@ -974,7 +1002,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                     )
                 )
 
-            self.output_blocks.append(nn.ModuleList(layers))
+            self.output_blocks.append(nn.CellList(layers))
 
         # level 1
         for i in range(3):
@@ -1000,7 +1028,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                     )
                 )
 
-            self.output_blocks.append(nn.ModuleList(layers))
+            self.output_blocks.append(nn.CellList(layers))
 
         # level 0
         for i in range(3):
@@ -1011,10 +1039,10 @@ class SdxlUNet2DConditionModel(nn.Module):
                 ),
             ]
 
-            self.output_blocks.append(nn.ModuleList(layers))
+            self.output_blocks.append(nn.CellList(layers))
 
         # output
-        self.out = nn.ModuleList(
+        self.out = nn.CellList(
             [GroupNorm32(32, self.model_channels), nn.SiLU(), nn.Conv2d(self.model_channels, self.out_channels, 3, padding=1)]
         )
 
@@ -1023,14 +1051,9 @@ class SdxlUNet2DConditionModel(nn.Module):
         self.config = SimpleNamespace()
 
     @property
-    def dtype(self) -> torch.dtype:
+    def dtype(self) -> ms.dtype:
         # `torch.dtype`: The dtype of the module (assuming that all the module parameters have the same dtype).
         return get_parameter_dtype(self)
-
-    @property
-    def device(self) -> torch.device:
-        # `torch.device`: The device on which the module is (assuming that all the module parameters are on the same device).
-        return get_parameter_device(self)
 
     def set_attention_slice(self, slice_size):
         raise NotImplementedError("Attention slicing is not supported for this model.")
@@ -1071,7 +1094,7 @@ class SdxlUNet2DConditionModel(nn.Module):
 
     # endregion
 
-    def forward(self, x, timesteps=None, context=None, y=None, **kwargs):
+    def construct(self, x, timesteps=None, context=None, y=None, **kwargs):
         # broadcast timesteps to batch dimension
         timesteps = timesteps.expand(x.shape[0])
 
@@ -1107,7 +1130,7 @@ class SdxlUNet2DConditionModel(nn.Module):
         h = call_module(self.middle_block, h, emb, context)
 
         for module in self.output_blocks:
-            h = torch.cat([h, hs.pop()], dim=1)
+            h = ops.cat([h, hs.pop()], axis=1)
             h = call_module(module, h, emb, context)
 
         h = h.type(x.dtype)
@@ -1121,7 +1144,7 @@ class InferSdxlUNet2DConditionModel:
         self.delegate = original_unet
 
         # override original model's forward method: because forward is not called by `__call__`
-        # overriding `__call__` is not enough, because nn.Module.forward has a special handling
+        # overriding `__call__` is not enough, because nn.Cell.forward has a special handling
         self.delegate.forward = self.forward
 
         # Deep Shrink
@@ -1156,7 +1179,7 @@ class InferSdxlUNet2DConditionModel:
             self.ds_timesteps_2 = ds_timesteps_2 if ds_timesteps_2 is not None else 1000
             self.ds_ratio = ds_ratio
 
-    def forward(self, x, timesteps=None, context=None, y=None, **kwargs):
+    def construct(self, x, timesteps=None, context=None, y=None, **kwargs):
         r"""
         current implementation is a copy of `SdxlUNet2DConditionModel.forward()` with Deep Shrink.
         """
@@ -1201,9 +1224,9 @@ class InferSdxlUNet2DConditionModel:
                 ):
                     # print("downsample", h.shape, self.ds_ratio)
                     org_dtype = h.dtype
-                    if org_dtype == torch.bfloat16:
-                        h = h.to(torch.float32)
-                    h = F.interpolate(h, scale_factor=self.ds_ratio, mode="bicubic", align_corners=False).to(org_dtype)
+                    if org_dtype == ms.bfloat16:
+                        h = h.to(ms.float32)
+                    h = ops.interpolate(h, scale_factor=self.ds_ratio, mode="bicubic", align_corners=False).to(org_dtype)
 
             h = call_module(module, h, emb, context)
             hs.append(h)
@@ -1217,7 +1240,7 @@ class InferSdxlUNet2DConditionModel:
                     # print("upsample", h.shape, hs[-1].shape)
                     h = resize_like(h, hs[-1])
 
-            h = torch.cat([h, hs.pop()], dim=1)
+            h = ops.cat([h, hs.pop()], axis=1)
             h = call_module(module, h, emb, context)
 
         # Deep Shrink: in case of depth 0
@@ -1231,56 +1254,56 @@ class InferSdxlUNet2DConditionModel:
         return h
 
 
-if __name__ == "__main__":
-    import time
+# if __name__ == "__main__":
+#     import time
 
-    logger.info("create unet")
-    unet = SdxlUNet2DConditionModel()
+#     logger.info("create unet")
+#     unet = SdxlUNet2DConditionModel()
 
-    unet.to("cuda")
-    unet.set_use_memory_efficient_attention(True, False)
-    unet.set_gradient_checkpointing(True)
-    unet.train()
+#     unet.to("cuda")
+#     unet.set_use_memory_efficient_attention(True, False)
+#     unet.set_gradient_checkpointing(True)
+#     unet.train()
 
-    # 使用メモリ量確認用の疑似学習ループ
-    logger.info("preparing optimizer")
+#     # 使用メモリ量確認用の疑似学習ループ
+#     logger.info("preparing optimizer")
 
-    # optimizer = torch.optim.SGD(unet.parameters(), lr=1e-3, nesterov=True, momentum=0.9) # not working
+#     # optimizer = torch.optim.SGD(unet.parameters(), lr=1e-3, nesterov=True, momentum=0.9) # not working
 
-    # import bitsandbytes
-    # optimizer = bitsandbytes.adam.Adam8bit(unet.parameters(), lr=1e-3)        # not working
-    # optimizer = bitsandbytes.optim.RMSprop8bit(unet.parameters(), lr=1e-3)  # working at 23.5 GB with torch2
-    # optimizer=bitsandbytes.optim.Adagrad8bit(unet.parameters(), lr=1e-3)  # working at 23.5 GB with torch2
+#     # import bitsandbytes
+#     # optimizer = bitsandbytes.adam.Adam8bit(unet.parameters(), lr=1e-3)        # not working
+#     # optimizer = bitsandbytes.optim.RMSprop8bit(unet.parameters(), lr=1e-3)  # working at 23.5 GB with torch2
+#     # optimizer=bitsandbytes.optim.Adagrad8bit(unet.parameters(), lr=1e-3)  # working at 23.5 GB with torch2
 
-    import transformers
+#     import transformers
 
-    optimizer = transformers.optimization.Adafactor(unet.parameters(), relative_step=True)  # working at 22.2GB with torch2
+#     optimizer = transformers.optimization.Adafactor(unet.parameters(), relative_step=True)  # working at 22.2GB with torch2
 
-    scaler = torch.cuda.amp.GradScaler(enabled=True)
+#     scaler = torch.cuda.amp.GradScaler(enabled=True)
 
-    logger.info("start training")
-    steps = 10
-    batch_size = 1
+#     logger.info("start training")
+#     steps = 10
+#     batch_size = 1
 
-    for step in range(steps):
-        logger.info(f"step {step}")
-        if step == 1:
-            time_start = time.perf_counter()
+#     for step in range(steps):
+#         logger.info(f"step {step}")
+#         if step == 1:
+#             time_start = time.perf_counter()
 
-        x = torch.randn(batch_size, 4, 128, 128).cuda()  # 1024x1024
-        t = torch.randint(low=0, high=10, size=(batch_size,), device="cuda")
-        ctx = torch.randn(batch_size, 77, 2048).cuda()
-        y = torch.randn(batch_size, ADM_IN_CHANNELS).cuda()
+#         x = torch.randn(batch_size, 4, 128, 128).cuda()  # 1024x1024
+#         t = torch.randint(low=0, high=10, size=(batch_size,))
+#         ctx = torch.randn(batch_size, 77, 2048).cuda()
+#         y = torch.randn(batch_size, ADM_IN_CHANNELS).cuda()
 
-        with torch.cuda.amp.autocast(enabled=True):
-            output = unet(x, t, ctx, y)
-            target = torch.randn_like(output)
-            loss = torch.nn.functional.mse_loss(output, target)
+#         with torch.cuda.amp.autocast(enabled=True):
+#             output = unet(x, t, ctx, y)
+#             target = torch.randn_like(output)
+#             loss = torch.nn.functional.mse_loss(output, target)
 
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
+#         scaler.scale(loss).backward()
+#         scaler.step(optimizer)
+#         scaler.update()
+#         optimizer.zero_grad(set_to_none=True)
 
-    time_end = time.perf_counter()
-    logger.info(f"elapsed time: {time_end - time_start} [sec] for last {steps - 1} steps")
+#     time_end = time.perf_counter()
+#     logger.info(f"elapsed time: {time_end - time_start} [sec] for last {steps - 1} steps")
