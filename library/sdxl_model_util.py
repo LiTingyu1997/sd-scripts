@@ -1,70 +1,54 @@
-import torch
-from accelerate import init_empty_weights
-from accelerate.utils.modeling import set_module_tensor_to_device
-from safetensors.torch import load_file, save_file
-from transformers import CLIPTextModel, CLIPTextConfig, CLIPTextModelWithProjection, CLIPTokenizer
-from typing import List
-from diffusers import AutoencoderKL, EulerDiscreteScheduler, UNet2DConditionModel
+import os
+import mindspore as ms
+from mindspore import ops, Parameter, nn
+
+from typing import Optional, Dict, Union, List
+import numpy as np
+from safetensors import numpy
+from tranformers import CLIPTextModel, CLIPTextConfig
+from mindone.transformers import CLIPTextModelWithProjection, CLIPTokenizer
+from mindone.diffusers import AutoencoderKL
 from library import model_util
 from library import sdxl_original_unet
-from .utils import setup_logging
-setup_logging()
+
 import logging
 logger = logging.getLogger(__name__)
 
 VAE_SCALE_FACTOR = 0.13025
 MODEL_VERSION_SDXL_BASE_V1_0 = "sdxl_base_v1-0"
 
-# Diffusersの設定を読み込むための参照モデル
-DIFFUSERS_REF_MODEL_ID_SDXL = "stabilityai/stable-diffusion-xl-base-1.0"
+# # Diffusersの設定を読み込むための参照モデル
+# DIFFUSERS_REF_MODEL_ID_SDXL = "stabilityai/stable-diffusion-xl-base-1.0"
 
-DIFFUSERS_SDXL_UNET_CONFIG = {
-    "act_fn": "silu",
-    "addition_embed_type": "text_time",
-    "addition_embed_type_num_heads": 64,
-    "addition_time_embed_dim": 256,
-    "attention_head_dim": [5, 10, 20],
-    "block_out_channels": [320, 640, 1280],
-    "center_input_sample": False,
-    "class_embed_type": None,
-    "class_embeddings_concat": False,
-    "conv_in_kernel": 3,
-    "conv_out_kernel": 3,
-    "cross_attention_dim": 2048,
-    "cross_attention_norm": None,
-    "down_block_types": ["DownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D"],
-    "downsample_padding": 1,
-    "dual_cross_attention": False,
-    "encoder_hid_dim": None,
-    "encoder_hid_dim_type": None,
-    "flip_sin_to_cos": True,
-    "freq_shift": 0,
-    "in_channels": 4,
-    "layers_per_block": 2,
-    "mid_block_only_cross_attention": None,
-    "mid_block_scale_factor": 1,
-    "mid_block_type": "UNetMidBlock2DCrossAttn",
-    "norm_eps": 1e-05,
-    "norm_num_groups": 32,
-    "num_attention_heads": None,
-    "num_class_embeds": None,
-    "only_cross_attention": False,
-    "out_channels": 4,
-    "projection_class_embeddings_input_dim": 2816,
-    "resnet_out_scale_factor": 1.0,
-    "resnet_skip_time_act": False,
-    "resnet_time_scale_shift": "default",
-    "sample_size": 128,
-    "time_cond_proj_dim": None,
-    "time_embedding_act_fn": None,
-    "time_embedding_dim": None,
-    "time_embedding_type": "positional",
-    "timestep_post_act": None,
-    "transformer_layers_per_block": [1, 2, 10],
-    "up_block_types": ["CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "UpBlock2D"],
-    "upcast_attention": False,
-    "use_linear_projection": True,
-}
+def load_file(filename: Union[str, os.PathLike]) -> Dict[str, ms.Tensor]:
+    """
+    Loads a safetensors file into mindspore format.
+
+    Args:
+        filename (`str`, or `os.PathLike`)):
+            The name of the file which contains the tensors
+
+    Returns:
+        `Dict[str, ms.Tensor]`: dictionary that contains name as key, value as `ms.Tensor`
+
+    Example:
+
+    ```python
+    from safetensors_ms import load_file
+
+    file_path = "./my_folder/bert.safetensors"
+    loaded = load_file(file_path)
+    ```
+    """
+    flat = numpy.load_file(filename)
+    output = _np2ms(flat)
+    return output
+
+
+def _np2ms(np_dict: Dict[str, np.ndarray]) -> Dict[str, ms.Tensor]:
+    for k, v in np_dict.items():
+        np_dict[k] = ms.Parameter(v, name=k)
+    return np_dict
 
 
 def convert_sdxl_text_encoder_2_checkpoint(checkpoint, max_length):
@@ -118,16 +102,16 @@ def convert_sdxl_text_encoder_2_checkpoint(checkpoint, max_length):
     for key in keys:
         if ".resblocks" in key and ".attn.in_proj_" in key:
             # 三つに分割
-            values = torch.chunk(checkpoint[key], 3)
+            values = ops.chunk(checkpoint[key], 3)
 
             key_suffix = ".weight" if "weight" in key else ".bias"
             key_pfx = key.replace(SDXL_KEY_PREFIX + "transformer.resblocks.", "text_model.encoder.layers.")
             key_pfx = key_pfx.replace("_weight", "")
             key_pfx = key_pfx.replace("_bias", "")
             key_pfx = key_pfx.replace(".attn.in_proj", ".self_attn.")
-            new_sd[key_pfx + "q_proj" + key_suffix] = values[0]
-            new_sd[key_pfx + "k_proj" + key_suffix] = values[1]
-            new_sd[key_pfx + "v_proj" + key_suffix] = values[2]
+            new_sd[key_pfx + "q_proj" + key_suffix] = Parameter(values[0])
+            new_sd[key_pfx + "k_proj" + key_suffix] = Parameter(values[1])
+            new_sd[key_pfx + "v_proj" + key_suffix] = Parameter(values[2])
 
     # logit_scale はDiffusersには含まれないが、保存時に戻したいので別途返す
     logit_scale = checkpoint.get(SDXL_KEY_PREFIX + "logit_scale", None)
@@ -147,11 +131,11 @@ def _load_state_dict_on_device(model, state_dict, dtype=None):
     missing_keys = list(model.state_dict().keys() - state_dict.keys())
     unexpected_keys = list(state_dict.keys() - model.state_dict().keys())
 
-    # # similar to model.load_state_dict()
-    # if not missing_keys and not unexpected_keys:
-    #     for k in list(state_dict.keys()):
-    #         set_module_tensor_to_device(model, k, device, value=state_dict.pop(k), dtype=dtype)
-    #     return "<All keys matched successfully>"
+    # similar to model.load_state_dict()
+    if not missing_keys and not unexpected_keys:
+        for k in list(state_dict.keys()):
+            set_module_tensor_to_device(model, k, device, value=state_dict.pop(k), dtype=dtype)
+        return "<All keys matched successfully>"
 
     # error_msgs
     error_msgs: List[str] = []
@@ -168,37 +152,33 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
     # dtype is used for full_fp16/bf16 integration. Text Encoder will remain fp32, because it runs on CPU when caching
 
     # Load the state dict
-    if model_util.is_safetensors(ckpt_path):
-        checkpoint = None
-        try:
-            state_dict = load_file(ckpt_path, device=map_location)
-        except:
-            state_dict = load_file(ckpt_path)  # prevent device invalid Error
-        epoch = None
-        global_step = None
-    else:
-        checkpoint = torch.load(ckpt_path, map_location=map_location)
-        if "state_dict" in checkpoint:
-            state_dict = checkpoint["state_dict"]
-            epoch = checkpoint.get("epoch", 0)
-            global_step = checkpoint.get("global_step", 0)
-        else:
-            state_dict = checkpoint
-            epoch = 0
-            global_step = 0
-        checkpoint = None
+    try:
+        state_dict = ms.load_checkpoint(ckpt_path)
+    except:
+        state_dict = load_file(ckpt_path)  # prevent device invalid Error
+        logger.info("load from safetensor")
+
+    epoch = None
+    global_step = None
 
     # U-Net
     logger.info("building U-Net")
-    with init_empty_weights():
-        unet = sdxl_original_unet.SdxlUNet2DConditionModel()
+    unet = sdxl_original_unet.SdxlUNet2DConditionModel()
 
     logger.info("loading U-Net from checkpoint")
     unet_sd = {}
     for k in list(state_dict.keys()):
         if k.startswith("model.diffusion_model."):
             unet_sd[k.replace("model.diffusion_model.", "")] = state_dict.pop(k)
-    info = _load_state_dict_on_device(unet, unet_sd, device=map_location, dtype=dtype)
+    if "safetensors" in ckpt_path:
+        unet_sd = _convert_state_dict(unet, unet_sd)
+    local_states = {k: v for k, v in unet.prameters_and_names()}
+    for k, v in unet_sd.items():
+        for k in local_states:
+            v.set_dtype(local_states[k].dtype)
+        else:
+            pass
+    info, _ = ms.load_param_into_net(unet, unet_sd)
     logger.info(f"U-Net: {info}")
 
     # Text Encoders
@@ -226,8 +206,7 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
         # torch_dtype="float32",
         # transformers_version="4.25.0.dev0",
     )
-    with init_empty_weights():
-        text_model1 = CLIPTextModel._from_config(text_model1_cfg)
+    text_model1 = CLIPTextModel(text_model1_cfg)
 
     # Text Encoder 2 is different from Stability AI's SDXL. SDXL uses open clip, but we use the model from HuggingFace.
     # Note: Tokenizer from HuggingFace is different from SDXL. We must use open clip's tokenizer.
@@ -252,8 +231,7 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
         # torch_dtype="float32",
         # transformers_version="4.25.0.dev0",
     )
-    with init_empty_weights():
-        text_model2 = CLIPTextModelWithProjection(text_model2_cfg)
+    text_model2 = CLIPTextModelWithProjection(text_model2_cfg)
 
     logger.info("loading text encoders from checkpoint")
     te1_sd = {}
@@ -267,23 +245,37 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
     # 最新の transformers では position_ids を含むとエラーになるので削除 / remove position_ids for latest transformers
     if "text_model.embeddings.position_ids" in te1_sd:
         te1_sd.pop("text_model.embeddings.position_ids")
-
-    info1 = _load_state_dict_on_device(text_model1, te1_sd, device=map_location)  # remain fp32
+    if "safetensors" in ckpt_path:
+        unet_sd = _convert_state_dict(text_model1, te1_sd)
+    local_states = {k: v for k, v in text_model1.prameters_and_names()}
+    for k, v in text_model1.items():
+        for k in local_states:
+            v.set_dtype(local_states[k].dtype)
+        else:
+            pass
+    info1, _ = ms.load_param_into_net(text_model1, te1_sd)
     logger.info(f"text encoder 1: {info1}")
 
     converted_sd, logit_scale = convert_sdxl_text_encoder_2_checkpoint(te2_sd, max_length=77)
-    info2 = _load_state_dict_on_device(text_model2, converted_sd, device=map_location)  # remain fp32
+    if "safetensors" in ckpt_path:
+        unet_sd = _convert_state_dict(text_model2, te2_sd)
+    local_states = {k: v for k, v in text_model2.prameters_and_names()}
+    for k, v in text_model2.items():
+        for k in local_states:
+            v.set_dtype(local_states[k].dtype)
+        else:
+            pass
+    info2, _ = ms.load_param_into_net(text_model2, te2_sd)
     logger.info(f"text encoder 2: {info2}")
 
     # prepare vae
     logger.info("building VAE")
     vae_config = model_util.create_vae_diffusers_config()
-    with init_empty_weights():
-        vae = AutoencoderKL(**vae_config)
+    vae = AutoencoderKL(**vae_config)
 
     logger.info("loading VAE from checkpoint")
     converted_vae_checkpoint = model_util.convert_ldm_vae_checkpoint(state_dict, vae_config)
-    info = _load_state_dict_on_device(vae, converted_vae_checkpoint, device=map_location, dtype=dtype)
+    info = ms.load_param_into_net(vae, converted_vae_checkpoint)
     logger.info(f"VAE: {info}")
 
     ckpt_info = (epoch, global_step) if epoch is not None else None
@@ -374,6 +366,39 @@ def make_unet_conversion_map():
     return unet_conversion_map
 
 
+def _get_pt2ms_mappings(m):
+    mappings = {}  # pt_param_name: (ms_param_name, pt_param_to_ms_param_func)
+    for name, cell in m.cells_and_names():
+        if isinstance(cell, (nn.Conv1d, nn.Conv1dTranspose)):
+            mappings[f"{name}.weight"] = f"{name}.weight", lambda x: ms.Parameter(
+                ops.expand_dims(x, axis=-2), name=x.name
+            )
+        elif isinstance(cell, nn.Embedding):
+            mappings[f"{name}.weight"] = f"{name}.embedding_table", lambda x: x
+        elif isinstance(cell, (nn.BatchNorm2d, nn.LayerNorm, nn.GroupNorm)):
+            mappings[f"{name}.weight"] = f"{name}.gamma", lambda x: x
+            mappings[f"{name}.bias"] = f"{name}.beta", lambda x: x
+            if isinstance(cell, (nn.BatchNorm2d,)):
+                mappings[f"{name}.running_mean"] = f"{name}.moving_mean", lambda x: x
+                mappings[f"{name}.running_var"] = f"{name}.moving_variance", lambda x: x
+                mappings[f"{name}.num_batches_tracked"] = None, lambda x: x
+    return mappings
+
+
+def _convert_state_dict(m, state_dict_pt):
+    if not state_dict_pt:
+        return state_dict_pt
+    pt2ms_mappings = _get_pt2ms_mappings(m)
+    state_dict_ms = {}
+    while state_dict_pt:
+        name_pt, data_pt = state_dict_pt.popitem()
+        name_ms, data_mapping = pt2ms_mappings.get(name_pt, (name_pt, lambda x: x))
+        data_ms = data_mapping(data_pt)
+        if name_ms is not None:
+            state_dict_ms[name_ms] = data_ms
+    return state_dict_ms
+
+
 def convert_diffusers_unet_state_dict_to_sdxl(du_sd):
     unet_conversion_map = make_unet_conversion_map()
 
@@ -383,7 +408,9 @@ def convert_diffusers_unet_state_dict_to_sdxl(du_sd):
 
 def convert_unet_state_dict(src_sd, conversion_map):
     converted_sd = {}
-    for src_key, value in src_sd.items():
+    for param in src_sd:
+        src_key = param.name
+        value = param.data
         # さすがに全部回すのは時間がかかるので右から要素を削りつつprefixを探す
         src_key_fragments = src_key.split(".")[:-1]  # remove weight/bias
         while len(src_key_fragments) > 0:
@@ -397,181 +424,3 @@ def convert_unet_state_dict(src_sd, conversion_map):
         assert len(src_key_fragments) > 0, f"key {src_key} not found in conversion map"
 
     return converted_sd
-
-
-def convert_sdxl_unet_state_dict_to_diffusers(sd):
-    unet_conversion_map = make_unet_conversion_map()
-
-    conversion_dict = {sd: hf for sd, hf in unet_conversion_map}
-    return convert_unet_state_dict(sd, conversion_dict)
-
-
-def convert_text_encoder_2_state_dict_to_sdxl(checkpoint, logit_scale):
-    def convert_key(key):
-        # position_idsの除去
-        if ".position_ids" in key:
-            return None
-
-        # common
-        key = key.replace("text_model.encoder.", "transformer.")
-        key = key.replace("text_model.", "")
-        if "layers" in key:
-            # resblocks conversion
-            key = key.replace(".layers.", ".resblocks.")
-            if ".layer_norm" in key:
-                key = key.replace(".layer_norm", ".ln_")
-            elif ".mlp." in key:
-                key = key.replace(".fc1.", ".c_fc.")
-                key = key.replace(".fc2.", ".c_proj.")
-            elif ".self_attn.out_proj" in key:
-                key = key.replace(".self_attn.out_proj.", ".attn.out_proj.")
-            elif ".self_attn." in key:
-                key = None  # 特殊なので後で処理する
-            else:
-                raise ValueError(f"unexpected key in DiffUsers model: {key}")
-        elif ".position_embedding" in key:
-            key = key.replace("embeddings.position_embedding.weight", "positional_embedding")
-        elif ".token_embedding" in key:
-            key = key.replace("embeddings.token_embedding.weight", "token_embedding.weight")
-        elif "text_projection" in key:  # no dot in key
-            key = key.replace("text_projection.weight", "text_projection")
-        elif "final_layer_norm" in key:
-            key = key.replace("final_layer_norm", "ln_final")
-        return key
-
-    keys = list(checkpoint.keys())
-    new_sd = {}
-    for key in keys:
-        new_key = convert_key(key)
-        if new_key is None:
-            continue
-        new_sd[new_key] = checkpoint[key]
-
-    # attnの変換
-    for key in keys:
-        if "layers" in key and "q_proj" in key:
-            # 三つを結合
-            key_q = key
-            key_k = key.replace("q_proj", "k_proj")
-            key_v = key.replace("q_proj", "v_proj")
-
-            value_q = checkpoint[key_q]
-            value_k = checkpoint[key_k]
-            value_v = checkpoint[key_v]
-            value = torch.cat([value_q, value_k, value_v])
-
-            new_key = key.replace("text_model.encoder.layers.", "transformer.resblocks.")
-            new_key = new_key.replace(".self_attn.q_proj.", ".attn.in_proj_")
-            new_sd[new_key] = value
-
-    if logit_scale is not None:
-        new_sd["logit_scale"] = logit_scale
-
-    return new_sd
-
-
-def save_stable_diffusion_checkpoint(
-    output_file,
-    text_encoder1,
-    text_encoder2,
-    unet,
-    epochs,
-    steps,
-    ckpt_info,
-    vae,
-    logit_scale,
-    metadata,
-    save_dtype=None,
-):
-    state_dict = {}
-
-    def update_sd(prefix, sd):
-        for k, v in sd.items():
-            key = prefix + k
-            if save_dtype is not None:
-                v = v.detach().clone().to("cpu").to(save_dtype)
-            state_dict[key] = v
-
-    # Convert the UNet model
-    update_sd("model.diffusion_model.", unet.state_dict())
-
-    # Convert the text encoders
-    update_sd("conditioner.embedders.0.transformer.", text_encoder1.state_dict())
-
-    text_enc2_dict = convert_text_encoder_2_state_dict_to_sdxl(text_encoder2.state_dict(), logit_scale)
-    update_sd("conditioner.embedders.1.model.", text_enc2_dict)
-
-    # Convert the VAE
-    vae_dict = model_util.convert_vae_state_dict(vae.state_dict())
-    update_sd("first_stage_model.", vae_dict)
-
-    # Put together new checkpoint
-    key_count = len(state_dict.keys())
-    new_ckpt = {"state_dict": state_dict}
-
-    # epoch and global_step are sometimes not int
-    if ckpt_info is not None:
-        epochs += ckpt_info[0]
-        steps += ckpt_info[1]
-
-    new_ckpt["epoch"] = epochs
-    new_ckpt["global_step"] = steps
-
-    if model_util.is_safetensors(output_file):
-        save_file(state_dict, output_file, metadata)
-    else:
-        torch.save(new_ckpt, output_file)
-
-    return key_count
-
-
-def save_diffusers_checkpoint(
-    output_dir, text_encoder1, text_encoder2, unet, pretrained_model_name_or_path, vae=None, use_safetensors=False, save_dtype=None
-):
-    from diffusers import StableDiffusionXLPipeline
-
-    # convert U-Net
-    unet_sd = unet.state_dict()
-    du_unet_sd = convert_sdxl_unet_state_dict_to_diffusers(unet_sd)
-
-    diffusers_unet = UNet2DConditionModel(**DIFFUSERS_SDXL_UNET_CONFIG)
-    if save_dtype is not None:
-        diffusers_unet.to(save_dtype)
-    diffusers_unet.load_state_dict(du_unet_sd)
-
-    # create pipeline to save
-    if pretrained_model_name_or_path is None:
-        pretrained_model_name_or_path = DIFFUSERS_REF_MODEL_ID_SDXL
-
-    scheduler = EulerDiscreteScheduler.from_pretrained(pretrained_model_name_or_path, subfolder="scheduler")
-    tokenizer1 = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer")
-    tokenizer2 = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer_2")
-    if vae is None:
-        vae = AutoencoderKL.from_pretrained(pretrained_model_name_or_path, subfolder="vae")
-
-    # prevent local path from being saved
-    def remove_name_or_path(model):
-        if hasattr(model, "config"):
-            model.config._name_or_path = None
-            model.config._name_or_path = None
-
-    remove_name_or_path(diffusers_unet)
-    remove_name_or_path(text_encoder1)
-    remove_name_or_path(text_encoder2)
-    remove_name_or_path(scheduler)
-    remove_name_or_path(tokenizer1)
-    remove_name_or_path(tokenizer2)
-    remove_name_or_path(vae)
-
-    pipeline = StableDiffusionXLPipeline(
-        unet=diffusers_unet,
-        text_encoder=text_encoder1,
-        text_encoder_2=text_encoder2,
-        vae=vae,
-        scheduler=scheduler,
-        tokenizer=tokenizer1,
-        tokenizer_2=tokenizer2,
-    )
-    if save_dtype is not None:
-        pipeline.to(None, save_dtype)
-    pipeline.save_pretrained(output_dir, safe_serialization=use_safetensors)
