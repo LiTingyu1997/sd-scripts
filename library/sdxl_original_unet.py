@@ -393,7 +393,7 @@ class CrossAttention(nn.Cell):
         self.use_sdpa = False
         self.flash_attention = MSFlashAttention(
             head_dim=self.dim_head,
-            head_num=self.head,
+            head_num=self.heads,
             fix_head_dims=[72],
             attention_dropout=0.0,
         )
@@ -451,7 +451,7 @@ class CrossAttention(nn.Cell):
         attention_scores = ops.baddbmm(
             ms.numpy.empty((query.shape[0], query.shape[1], key.shape[1]), dtype=query.dtype),
             query,
-            ops.transpose(key, (0, 2, 1),
+            ops.transpose(key, (0, 2, 1)),
             beta=0,
             alpha=self.scale,
         )
@@ -468,7 +468,7 @@ class CrossAttention(nn.Cell):
         return hidden_states
 
     # TODO support Hypernetworks
-    def construct_memory_efficient_fa(self, x, context=None, mask=None):
+    def forward_memory_efficient_fa(self, x, context=None, mask=None):
         h = self.heads
         q_in = self.to_q(x)
         context = context if context is not None else x
@@ -554,7 +554,7 @@ class GEGLU(nn.Cell):
         return ops.gelu(gate.to(dtype=ms.float32)).to(dtype=gate.dtype)
 
     def construct(self, hidden_states):
-        hidden_states, gate = self.proj(hidden_states).chunk(2, dim=-1)
+        hidden_states, gate = self.proj(hidden_states).chunk(2, axis=-1)
         return hidden_states * self.gelu(gate)
 
 
@@ -586,7 +586,7 @@ class BasicTransformerBlock(nn.Cell):
     ):
         super().__init__()
 
-        self._gradient_checkpointing = False
+        self.gradient_checkpointing = False
 
         # 1. Self-Attn
         self.attn1 = CrossAttention(
@@ -607,11 +607,11 @@ class BasicTransformerBlock(nn.Cell):
             upcast_attention=upcast_attention,
         )
 
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
+        self.norm1 = nn.LayerNorm((dim, ))
+        self.norm2 = nn.LayerNorm((dim, ))
 
         # 3. Feed-forward
-        self.norm3 = nn.LayerNorm(dim)
+        self.norm3 = nn.LayerNorm((dim, ))
 
     def set_use_memory_efficient_attention(self, xformers: bool, mem_eff: bool):
         self.attn1.set_use_memory_efficient_attention(xformers, mem_eff)
@@ -691,7 +691,7 @@ class Transformer2DModel(nn.Cell):
         else:
             self.proj_out = nn.Conv2d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0, pad_mode="pad", has_bias=True)
 
-        self._gradient_checkpointing = False
+        self.gradient_checkpointing = False
 
     def set_use_memory_efficient_attention(self, xformers, mem_eff):
         for transformer in self.transformer_blocks:
@@ -749,7 +749,7 @@ class Upsample2D(nn.Cell):
     @gradient_checkpointing.setter
     def gradient_checkpointing(self, value):
         self._gradient_checkpointing = value
-        self.construct_body._recompute(value)
+        self.recompute()
 
     def construct(self, hidden_states, output_size=None):
         assert hidden_states.shape[1] == self.channels
@@ -767,7 +767,7 @@ class Upsample2D(nn.Cell):
 
         # if `output_size` is passed we force the interpolation output size and do not make use of `scale_factor=2`
         if output_size is None:
-            hidden_states = ops.interpolate(hidden_states, scale_factor=2.0, mode="nearest")
+            hidden_states = ops.interpolate(hidden_states, scale_factor=2.0, mode="nearest", recompute_scale_factor=True)
         else:
             hidden_states = ops.interpolate(hidden_states, size=output_size, mode="nearest")
 
@@ -795,7 +795,7 @@ class SdxlUNet2DConditionModel(nn.Cell):
         self.time_embed_dim = TIME_EMBED_DIM
         self.adm_in_channels = ADM_IN_CHANNELS
 
-        self._gradient_checkpointing = False
+        self.gradient_checkpointing = False
         # self.sample_size = sample_size
 
         # time embedding
@@ -815,13 +815,12 @@ class SdxlUNet2DConditionModel(nn.Cell):
         )
 
         # input
-        input_blocks = (
+        input_blocks = 
             [
                 nn.SequentialCell(
                     nn.Conv2d(self.in_channels, self.model_channels, kernel_size=3, padding=1, pad_mode="pad", has_bias=True),
                 )
             ]
-        )
 
         # level 0
         for i in range(2):
@@ -886,7 +885,7 @@ class SdxlUNet2DConditionModel(nn.Cell):
                 ),
             ]
             input_blocks.append(nn.CellList(layers))
-        self.middle_block = nn.CellList(input_blocks)
+        self.input_blocks = nn.CellList(input_blocks)
 
         # mid
         self.middle_block = nn.CellList(
@@ -911,7 +910,7 @@ class SdxlUNet2DConditionModel(nn.Cell):
         )
 
         # output
-        output_blocks = nn.CellList([])
+        output_blocks = []
 
         # level 2
         for i in range(3):
@@ -999,7 +998,7 @@ class SdxlUNet2DConditionModel(nn.Cell):
 
     def enable_gradient_checkpointing(self):
         self.gradient_checkpointing = True
-        self.set_gradient_checkpointing(value=True)
+        #self.set_gradient_checkpointing(value=True)
 
     def disable_gradient_checkpointing(self):
         self.gradient_checkpointing = False
@@ -1049,7 +1048,7 @@ class SdxlUNet2DConditionModel(nn.Cell):
                     module.gradient_checkpointing = value
 
     def to(self, dtype: Optional[ms.Type] = None):
-        for p in self.get_parameter():
+        for p in self.get_parameters():
             p.set_dtype(dtype)
         return self
 
