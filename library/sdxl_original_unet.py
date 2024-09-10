@@ -1056,7 +1056,8 @@ class SdxlUNet2DConditionModel(nn.Cell):
 
     def construct(self, x, timesteps=None, context=None, y=None, **kwargs):
         # broadcast timesteps to batch dimension
-        timesteps = timesteps.tile((x.shape[0], ))
+        if len(timesteps.shape) == 0 or timesteps.shape[0] != x.shape[0]:
+            timesteps = timesteps.tile((x.shape[0], ))
 
         hs = []
         t_emb = get_timestep_embedding(timesteps, self.model_channels, downscale_freq_shift=0)  # , repeat_only=False)
