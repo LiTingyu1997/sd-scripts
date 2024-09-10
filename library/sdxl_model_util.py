@@ -5,8 +5,8 @@ from mindspore import ops, Parameter, nn
 from typing import Optional, Dict, Union, List
 import numpy as np
 from safetensors import numpy
-from tranformers import CLIPTextModel, CLIPTextConfig
-from mindone.transformers import CLIPTextModelWithProjection, CLIPTokenizer
+from tranformers import CLIPTextConfig, CLIPTokenizer
+from mindone.transformers import CLIPTextModel, CLIPTextModelWithProjection, 
 from mindone.diffusers import AutoencoderKL
 from library import model_util
 from library import sdxl_original_unet
@@ -134,7 +134,7 @@ def _load_state_dict_on_device(model, state_dict, dtype=None):
     # similar to model.load_state_dict()
     if not missing_keys and not unexpected_keys:
         for k in list(state_dict.keys()):
-            set_module_tensor_to_device(model, k, device, value=state_dict.pop(k), dtype=dtype)
+            set_module_tensor_to_device(model, k, value=state_dict.pop(k), dtype=dtype)
         return "<All keys matched successfully>"
 
     # error_msgs
@@ -246,9 +246,9 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
     if "text_model.embeddings.position_ids" in te1_sd:
         te1_sd.pop("text_model.embeddings.position_ids")
     if "safetensors" in ckpt_path:
-        unet_sd = _convert_state_dict(text_model1, te1_sd)
+        tel_sd = _convert_state_dict(text_model1, te1_sd)
     local_states = {k: v for k, v in text_model1.prameters_and_names()}
-    for k, v in text_model1.items():
+    for k, v in tel_sd.items():
         for k in local_states:
             v.set_dtype(local_states[k].dtype)
         else:
@@ -258,14 +258,14 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
 
     converted_sd, logit_scale = convert_sdxl_text_encoder_2_checkpoint(te2_sd, max_length=77)
     if "safetensors" in ckpt_path:
-        unet_sd = _convert_state_dict(text_model2, te2_sd)
-    local_states = {k: v for k, v in text_model2.prameters_and_names()}
-    for k, v in text_model2.items():
+        converted_sd = _convert_state_dict(text_model2, converted_sd)
+    local_states = {k: v for k, v in text_model2.parameters_and_names()}
+    for k, v in converted_sd.items():
         for k in local_states:
             v.set_dtype(local_states[k].dtype)
         else:
             pass
-    info2, _ = ms.load_param_into_net(text_model2, te2_sd)
+    info2, _ = ms.load_param_into_net(text_model2, converted_sd)
     logger.info(f"text encoder 2: {info2}")
 
     # prepare vae
@@ -275,7 +275,7 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
 
     logger.info("loading VAE from checkpoint")
     converted_vae_checkpoint = model_util.convert_ldm_vae_checkpoint(state_dict, vae_config)
-    info = ms.load_param_into_net(vae, converted_vae_checkpoint)
+    info, _ = ms.load_param_into_net(vae, converted_vae_checkpoint)
     logger.info(f"VAE: {info}")
 
     ckpt_info = (epoch, global_step) if epoch is not None else None

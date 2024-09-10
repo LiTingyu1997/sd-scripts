@@ -206,10 +206,10 @@ def convert_ldm_vae_checkpoint(checkpoint, config):
     new_checkpoint["post_quant_conv.weight"] = vae_state_dict["post_quant_conv.weight"]
     new_checkpoint["post_quant_conv.bias"] = vae_state_dict["post_quant_conv.bias"]
 
-    if "encoder.conv_norm_out.gamma" in vae_state_dict.keys():
-        new_checkpoint["encoder.conv_norm_out.gamma"] = vae_state_dict["encoder.norm_out.weight"]
+    if "encoder.norm_out.gamma" in vae_state_dict.keys():
+        new_checkpoint["encoder.conv_norm_out.gamma"] = vae_state_dict["encoder.norm_out.gamma"]
         new_checkpoint["encoder.conv_norm_out.beta"] = vae_state_dict["encoder.norm_out.beta"]
-        new_checkpoint["decoder.conv_norm_out.gamma"] = vae_state_dict["decoder.norm_out.weight"]
+        new_checkpoint["decoder.conv_norm_out.gamma"] = vae_state_dict["decoder.norm_out.gamma"]
         new_checkpoint["decoder.conv_norm_out.beta"] = vae_state_dict["decoder.norm_out.beta"]
     else:
         new_checkpoint["encoder.conv_norm_out.gamma"] = vae_state_dict["encoder.norm_out.weight"]

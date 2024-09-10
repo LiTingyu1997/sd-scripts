@@ -1217,7 +1217,7 @@ class InferSdxlUNet2DConditionModel:
 
 if __name__ == "__main__":
     import time
-    ms.set_context(mode=ms.GRAPH_MODE, jit_syntax_levels=ms.STRICT)
+    ms.set_context(mode=ms.GRAPH_MODE, jit_syntax_level=ms.STRICT)
     logger.info("create unet")
     unet = SdxlUNet2DConditionModel()
     noisy_latents = ops.randn(1, 4, 52, 52).to(ms.float32)
